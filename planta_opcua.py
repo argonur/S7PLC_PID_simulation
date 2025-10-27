@@ -1,8 +1,8 @@
 """
 planta_opcua.py
-Simula una planta primer orden y comunica con PLC via OPC UA.
-Lee MV (manipulated variable) desde el PLC y escribe PV (process value) de vuelta.
-Diseñado para usarse con PLCSIM Advanced exponiendo variables OPC UA (p.ej. DB1.MV, DB1.PV).
+First-order plant simulation with OPC UA communication to a PLC.
+Reads MV from PLC and writes PV back. Designed for PLCSIM Advanced
+exposing OPC UA variables (e.g., DB1.MV, DB1.PV).
 """
 
 import time
@@ -10,63 +10,57 @@ from opcua import Client, ua
 import sys
 import random
 
-# === CONFIG (ajusta según tu proyecto TIA/PLCSIM) ===
-OPC_ENDPOINT = "opc.tcp://192.168.0.1:4840"   # ajusta si PLCSIM usa otra IP/puerto
-NODE_MV = 'ns=3;s="PID_SIM_3_DB"."ManipulatedValue"'    # ejemplo de NodeId; confirma en tu servidor OPC UA
-NODE_PV = 'ns=3;s="PID_SIM_3_DB"."ProcessValue"'
-TS = 0.1   # tiempo de muestreo [s] -> debe coincidir con tu OB en PLC
-Kproc = 1.0
-Tau = 2.0  # segundos (constante de tiempo de la planta)
-NOISE_PCT = 0.0025  # 0.0 para pruebas sin ruido, 0.0025 = ±0.25%
+# === CONFIGURATION ===
+OPC_ENDPOINT = "opc.tcp://192.168.0.1:4840"  # OPC UA endpoint
+NODE_MV = 'ns=3;s="PID_SIM_3_DB"."ManipulatedValue"'  # NodeId for MV
+NODE_PV = 'ns=3;s="PID_SIM_3_DB"."ProcessValue"'      # NodeId for PV
+TS = 0.1          # sampling time [s] (must match OB in PLC)
+Kproc = 1.0       # plant gain
+Tau = 2.0         # plant time constant [s]
+NOISE_PCT = 0.0025  # ±0.25% multiplicative noise
 
-# === Delay settings ===
-delay_seconds = 10.0
-delay_samples = int(delay_seconds / TS + 0.5)
+# === DELAY SETTINGS ===
+DELAY_SEC = 10.0
+DELAY_SAMPLES = int(DELAY_SEC / TS + 0.5)
 
-# variables internas de la planta
-pv = 20.0  # valor inicial (en la misma escala que uses, ej 0..100)
+# Initialize plant state and FIFO for delayed MV
+pv = 20.0
 t = 0.0
-
-# Inicializa FIFO con un valor neutro
 initial_mv = 0.0
-fifo = [initial_mv] * delay_samples
+fifo = [initial_mv] * DELAY_SAMPLES
 
-# --- funciones auxiliares ---
+# --- HELPER FUNCTIONS ---
 
 def connect_client():
-    """Intenta conectar al servidor OPC UA con reintentos."""
+    """Connect to OPC UA server with retry loop."""
     while True:
         try:
             client = Client(OPC_ENDPOINT)
             client.connect()
-            print(f"[OK] Conectado a {OPC_ENDPOINT}")
-            node_mv = client.get_node(NODE_MV)
-            node_pv = client.get_node(NODE_PV)
-            return client, node_mv, node_pv
+            print(f"[OK] Connected to {OPC_ENDPOINT}")
+            return client, client.get_node(NODE_MV), client.get_node(NODE_PV)
         except Exception as e:
-            print(f"[WARN] Falló conexión: {e}")
-            print("Reintentando en 3 s...")
+            print(f"[WARN] Connection failed: {e}. Retrying in 3s...")
             time.sleep(3)
 
 def write_value(node, value):
-    """Escribe un float en el nodo dado."""
+    """Write float value to OPC UA node."""
     try:
-        data_value = ua.DataValue(ua.Variant(pv, ua.VariantType.Float))
-        node.set_attribute(ua.AttributeIds.Value, data_value)
+        node.set_attribute(ua.AttributeIds.Value, ua.DataValue(ua.Variant(value, ua.VariantType.Float)))
         return True
     except Exception as e:
-        print(f"Error escribiendo PV: {e}")
+        print(f"Error writing PV: {e}")
         return False
 
 def read_value(node):
-    """Lee valor de nodo OPC UA (float)."""
+    """Read float value from OPC UA node."""
     try:
         return float(node.get_value())
     except Exception as e:
-        print(f"Error leyendo MV: {e}")
+        print(f"Error reading MV: {e}")
         return None
 
-# --- bucle principal ---
+# --- MAIN LOOP ---
 
 client, node_mv, node_pv = connect_client()
 
@@ -74,62 +68,54 @@ try:
     while True:
         start = time.time()
 
-        # Leer MV desde PLC (suponiendo REAL)
+        # Read MV from PLC
         mv = read_value(node_mv)
         if mv is None:
-            # comunicación caída → reconectar
             client.disconnect()
-            print("[INFO] Reconectando...")
+            print("[INFO] Reconnecting...")
             client, node_mv, node_pv = connect_client()
             continue
 
-         # --- APLICA RETARDO ---
+        # Apply FIFO delay
         fifo.append(mv)
         mv_delayed = fifo.pop(0)
 
-        # Modelo primer orden discretizado (Euler explícito)
-        # dPV/dt = (Kproc * MV - PV) / Tau   => PV_next = PV + Ts * ((Kproc*MV - PV) / Tau)
+        # First-order plant model (explicit Euler)
         new_pv = pv + TS * ((Kproc * mv_delayed - pv) / Tau)
 
-        # Ruido multiplicativo (aplicar sobre el nuevo PV)
-        noise = (random.random() - 0.5) * 2.0 * NOISE_PCT   # -NOISE_PCT .. +NOISE_PCT
-        new_pv = new_pv * (1.0 + noise)
+        # Apply multiplicative noise
+        noise = (random.random() - 0.5) * 2.0 * NOISE_PCT
+        new_pv *= (1.0 + noise)
 
-        # Option: saturate PV to 0..100
-        if new_pv < 0.0:
-            new_pv = 0.0
-        elif new_pv > 100.0:
-            new_pv = 100.0
-
+        # Saturate PV to 0..100
+        new_pv = max(0.0, min(100.0, new_pv))
         pv = new_pv
 
-        # Escribir PV de vuelta al PLC
-        ok = write_value(node_pv, pv)
-        if not ok:
+        # Write PV back to PLC
+        if not write_value(node_pv, pv):
             client.disconnect()
-            print("[INFO] Reconectando...")
+            print("[INFO] Reconnecting...")
             client, node_mv, node_pv = connect_client()
             continue
 
-        # logging ligero
+        # Simple logging
         print(f"t={t:.2f}s  MV={mv:.2f}  MV_delayed={mv_delayed:.2f}  PV={pv:.3f}")
 
-        # sincronizar con Ts
+        # Synchronize loop with TS
         elapsed = time.time() - start
         sleep_for = TS - elapsed
         if sleep_for > 0:
             time.sleep(sleep_for)
         else:
-            # si estamos atrasados, warn y seguir sin sleep
-            print(f"Warning: loop tardó {elapsed:.3f}s > TS={TS}s")
+            print(f"Warning: loop took {elapsed:.3f}s > TS={TS}s")
         t += TS
 
 except KeyboardInterrupt:
-    print("\n[SIGINT] Cancelado por el usuario.")
+    print("\n[SIGINT] Cancelled by user.")
 finally:
     try:
         client.disconnect()
-        print("[OK] Desconectado correctamente.")
+        print("[OK] Disconnected correctly.")
     except:
         pass
 

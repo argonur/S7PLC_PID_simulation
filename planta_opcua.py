@@ -7,7 +7,7 @@ Diseñado para usarse con PLCSIM Advanced exponiendo variables OPC UA (p.ej. DB1
 
 import time
 from opcua import Client, ua
-import math
+import sys
 import random
 
 # === CONFIG (ajusta según tu proyecto TIA/PLCSIM) ===
@@ -23,16 +23,6 @@ NOISE_PCT = 0.0025  # 0.0 para pruebas sin ruido, 0.0025 = ±0.25%
 delay_seconds = 10.0
 delay_samples = int(delay_seconds / TS + 0.5)
 
-# === Inicialización ===
-client = Client(OPC_ENDPOINT)
-# Si el servidor exige certificados, deberás gestionar los certificados aquí (no cubierto).
-client.connect()
-print("Conectado a OPC UA:", OPC_ENDPOINT)
-
-# obtener nodos
-node_mv = client.get_node(NODE_MV)
-node_pv = client.get_node(NODE_PV)
-
 # variables internas de la planta
 pv = 20.0  # valor inicial (en la misma escala que uses, ej 0..100)
 t = 0.0
@@ -41,16 +31,57 @@ t = 0.0
 initial_mv = 0.0
 fifo = [initial_mv] * delay_samples
 
+# --- funciones auxiliares ---
+
+def connect_client():
+    """Intenta conectar al servidor OPC UA con reintentos."""
+    while True:
+        try:
+            client = Client(OPC_ENDPOINT)
+            client.connect()
+            print(f"[OK] Conectado a {OPC_ENDPOINT}")
+            node_mv = client.get_node(NODE_MV)
+            node_pv = client.get_node(NODE_PV)
+            return client, node_mv, node_pv
+        except Exception as e:
+            print(f"[WARN] Falló conexión: {e}")
+            print("Reintentando en 3 s...")
+            time.sleep(3)
+
+def write_value(node, value):
+    """Escribe un float en el nodo dado."""
+    try:
+        data_value = ua.DataValue(ua.Variant(pv, ua.VariantType.Float))
+        node.set_attribute(ua.AttributeIds.Value, data_value)
+        return True
+    except Exception as e:
+        print(f"Error escribiendo PV: {e}")
+        return False
+
+def read_value(node):
+    """Lee valor de nodo OPC UA (float)."""
+    try:
+        return float(node.get_value())
+    except Exception as e:
+        print(f"Error leyendo MV: {e}")
+        return None
+
+# --- bucle principal ---
+
+client, node_mv, node_pv = connect_client()
+
 try:
     while True:
         start = time.time()
 
         # Leer MV desde PLC (suponiendo REAL)
-        try:
-            mv = node_mv.get_value()
-        except Exception as e:
-            print("Error leyendo MV:", e)
-            mv = 0.0
+        mv = read_value(node_mv)
+        if mv is None:
+            # comunicación caída → reconectar
+            client.disconnect()
+            print("[INFO] Reconectando...")
+            client, node_mv, node_pv = connect_client()
+            continue
 
          # --- APLICA RETARDO ---
         fifo.append(mv)
@@ -73,11 +104,12 @@ try:
         pv = new_pv
 
         # Escribir PV de vuelta al PLC
-        try:
-            data_value = ua.DataValue(ua.Variant(pv, ua.VariantType.Float))
-            node_pv.set_attribute(ua.AttributeIds.Value, data_value)
-        except Exception as e:
-            print(f"Error escribiendo PV: {e}")
+        ok = write_value(node_pv, pv)
+        if not ok:
+            client.disconnect()
+            print("[INFO] Reconectando...")
+            client, node_mv, node_pv = connect_client()
+            continue
 
         # logging ligero
         print(f"t={t:.2f}s  MV={mv:.2f}  MV_delayed={mv_delayed:.2f}  PV={pv:.3f}")
@@ -101,5 +133,4 @@ finally:
     except:
         pass
 
-
-
+    sys.exit(0)
